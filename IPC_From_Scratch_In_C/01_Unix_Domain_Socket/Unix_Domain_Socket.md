@@ -26,7 +26,7 @@ Servers identify and process both the type of messages very differently.
 Client Handles are also called "data_sockets"
 - M is only used to create new client handles. M is not used for data exchange with already connected clients.
 
-     M <--------- New connection request ------------------------------------------S1
+     M <------------------------- connect() --------------------------------------S1
       ---- accept() ---- create -----> C1 (Client Handle) <-------Data exchange ---
 
 - accept() is the system call used on server side to create client handles
