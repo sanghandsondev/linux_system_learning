@@ -1,400 +1,386 @@
-# Multithreading trong Linux - Deep Dive (Không bàn code C++ ở phần này)
+# Multithreading trong Linux
 
-## 1) Mục tiêu học phần này
+## 1) Process vs Thread: Linux không phân biệt nhiều
 
-Tài liệu này tập trung vào bản chất hệ thống:
+Kernel Linux quản lý mọi thứ qua **task** (task_struct). Process và thread đều là task — khác nhau ở chỗ thread **chia sẻ address space**, file descriptor, signal handler với nhau; còn process thì không.
 
-- CPU thực sự chạy thread như thế nào.
-- Kernel Linux quản lý process và thread ra sao.
-- Scheduler quyết định ai chạy, chạy khi nào.
-- Context switch diễn ra theo từng bước nào và tốn chi phí gì.
-- Vì sao multithread có lúc tăng tốc, có lúc chậm hơn single-thread.
+- Thread cùng process đọc/ghi chung vùng nhớ trực tiếp → nhanh hơn IPC, nhưng cần đồng bộ.
+- Context switch giữa 2 thread cùng process rẻ hơn 2 process vì không cần đổi page table (mm_struct).
 
-Không đi vào cách viết API C++ tạo thread. Trọng tâm là cơ chế nền tảng của Linux system.
+### fork() vs clone()
 
----
-
-## 2) Bức tranh tổng thể
-
-Multithreading trên Linux là phối hợp của 3 lớp:
-
-1. Phần cứng CPU: core, cache, TLB, interrupt, chế độ user/kernel.
-2. Linux kernel: scheduler, task management, memory management, sync primitives.
-3. User-space process: ứng dụng tạo nhiều luồng thực thi, kernel quyết định lịch chạy.
-
-Kết luận quan trọng:
-
-- Linux không có một thực thể thread tách biệt hoàn toàn với process theo kiểu triết học.
-- Linux có đơn vị lập lịch là task.
-- Process và thread đều là task, khác nhau chủ yếu ở mức độ chia sẻ tài nguyên.
-
-### Sơ đồ tổng quan 3 lớp (CPU -> Kernel -> User-space)
-
-```mermaid
-flowchart LR
-	U[User-space Process\nNhiều thread] -->|syscall/futex/I-O| K[Linux Kernel\nScheduler + Memory + Sync]
-	K -->|dispatch| C[CPU Core]
-	C -->|timer interrupt/IRQ| K
-	K -->|run next task| U
-```
+- `fork()` tạo process mới, copy address space (copy-on-write).
+- `clone()` là syscall nền mà `pthread_create` dùng — cho phép chỉ định tài nguyên nào chia sẻ (flag `CLONE_VM`, `CLONE_FILES`, `CLONE_SIGHAND`...).
+- Thread thực chất là `clone()` với đủ các flag chia sẻ.
 
 ---
 
-## 3) Process và Thread trong Linux: góc nhìn kernel
+## 2) Scheduler: ai được chạy
 
-### 3.1 Đơn vị lõi là task
+Linux có 3 tầng ưu tiên:
+1. **Deadline** – deadline cứng
+2. **Real-time** (FIFO/RR) – ưu tiên cao, dùng cho RT task
+3. **CFS** – mặc định cho app thường
 
-Kernel theo dõi thực thể chạy bằng cấu trúc đại diện task (thực tế là task_struct).
-
-Mỗi task có:
-
-- Tập thanh ghi lưu trạng thái chạy.
-- Trạng thái scheduler (running, runnable, sleeping...).
-- Kernel stack riêng.
-- Metadata về tín hiệu, ưu tiên, affinity, accounting.
-
-### 3.2 Process vs Thread là khác biệt chia sẻ tài nguyên
-
-Các task trong cùng một process thường chia sẻ:
-
-- Không gian địa chỉ ảo (mm_struct).
-- Bảng file descriptor.
-- Trình xử lý signal (nhiều phần).
-- Thư mục làm việc, thông tin filesystem context.
-
-Điều này nghĩa là:
-
-- Thread cùng process có thể đọc/ghi chung vùng nhớ user-space.
-- Chuyển đổi giữa thread cùng process thường rẻ hơn so với đổi process khác không gian địa chỉ.
-- Nhưng vẫn có overhead scheduler và tác động cache/TLB.
-
----
-
-## 4) CPU nhìn thấy gì khi chạy multithread
-
-### 4.1 Một core chạy gì tại một thời điểm
-
-- Một core vật lý tại một thời điểm chỉ retire chuỗi lệnh của một luồng phần cứng.
-- Nếu có SMT/Hyper-Threading, một core vật lý có thể có nhiều logical CPU, nhưng vẫn chia sẻ tài nguyên nội bộ.
-
-### 4.2 Hai kiểu đồng thời
-
-1. Parallel thực: thread chạy trên các core khác nhau cùng lúc.
-2. Interleaving theo thời gian: cùng một core, kernel chuyển context rất nhanh.
-
-### 4.3 User mode và Kernel mode
-
-- User mode: chạy mã ứng dụng.
-- Kernel mode: xử lý syscall, interrupt, fault, scheduler.
-
-Mọi quyết định lập lịch và context switch đều nằm trong kernel mode.
-
----
-
-## 5) Scheduler Linux: ai được chạy và vì sao
-
-Linux có nhiều scheduling class. Trực giác mức ưu tiên:
-
-1. Deadline class.
-2. Real-time class (FIFO/RR).
-3. CFS class cho tác vụ thông thường.
-
-Phần lớn app bình thường chạy ở CFS.
-
-### 5.1 CFS (Completely Fair Scheduler)
-
-Ý tưởng:
+### CFS (Completely Fair Scheduler)
 
 - Mỗi CPU có runqueue riêng.
-- Task runnable được theo dõi bằng virtual runtime (vruntime).
-- Task có vruntime nhỏ hơn sẽ được ưu tiên để giữ công bằng.
+- Mỗi task có **vruntime** – thời gian CPU đã dùng (điều chỉnh theo nice weight).
+- Task có vruntime **nhỏ nhất** được chọn chạy tiếp.
+- Khi task migrate sang CPU khác → mất cache locality.
 
-Công bằng ở đây là công bằng theo trọng số (nice), không phải chia chính xác từng mili-giây tuyệt đối.
+### Preemption
 
-### 5.2 Load balancing
+- **Voluntary**: thread tự yield (block I/O, futex wait, `sched_yield()`).
+- **Involuntary**: kernel preempt khi hết time slice hoặc task ưu tiên cao hơn wakeup.
 
-- Vì mỗi CPU có runqueue riêng, kernel phải cân bằng tải giữa các CPU.
-- Khi migrate task sang CPU khác, có thể tăng chi phí do mất locality cache.
+I/O-heavy thread thường voluntary sleep nhiều → vruntime thấp → khi wakeup được ưu tiên cao hơn CPU-heavy thread.
 
-### Sơ đồ lập lịch CFS (đơn giản hóa)
+---
 
-```mermaid
-flowchart TD
-	A[Task Runnable vào runqueue CPU_i] --> B[Chèn vào cây đỏ-đen theo vruntime]
-	B --> C[Chọn task có vruntime nhỏ nhất]
-	C --> D[Chạy trên CPU]
-	D --> E[Cập nhật vruntime theo thời gian chạy và weight nice]
-	E --> F{Task còn runnable?}
-	F -- Có --> B
-	F -- Không, bị block --> G[Ra khỏi runqueue\nchờ wakeup]
-	G --> A
+## 3) Context switch: tốn gì
+
+Khi timer interrupt hoặc syscall kích hoạt:
+
+1. Lưu register + stack pointer của task đang chạy.
+2. Scheduler chọn task kế tiếp từ runqueue.
+3. Nạp state của task mới, return to user mode.
+
+**Chi phí thực sự** không chỉ save/restore register:
+
+```
+T_switch = T_save_restore + T_sched + T_cache_cold + T_tlb + T_migration
 ```
 
+- **Cache cold**: working set mới chưa có trong L1/L2 → cache miss tăng.
+- **TLB flush**: nếu switch sang process khác (khác address space).
+- **CPU migration**: nếu task chạy trên core khác, data không còn local.
+
+Context switch giữa 2 thread cùng process không cần TLB flush (cùng mm_struct), nhưng vẫn bị cache cold nếu working set khác nhau.
+
 ---
 
-## 6) Context switch: từng bước diễn ra trong kernel
+## 4) Trạng thái task
 
-Một context switch điển hình:
-
-1. CPU nhận timer interrupt hoặc thread đi vào kernel qua syscall/fault.
-2. Kernel cập nhật accounting thời gian chạy task hiện tại.
-3. Kernel kiểm tra cờ cần reschedule.
-4. Scheduler chọn task kế tiếp từ runqueue.
-5. Lưu state task cũ (register, stack pointer, metadata liên quan).
-6. Nạp state task mới.
-7. Chuyển sang task mới và quay lại user mode nếu cần.
-
-### Sơ đồ context switch theo dòng thời gian
-
-```mermaid
-sequenceDiagram
-	participant CPU as CPU Core
-	participant K as Linux Kernel
-	participant A as Task A
-	participant B as Task B
-
-	A->>CPU: Đang chạy user code
-	CPU->>K: Timer IRQ / Syscall / Fault
-	K->>K: Check need_resched
-	K->>K: Lưu ngữ cảnh A
-	K->>K: Chọn B từ runqueue
-	K->>K: Nạp ngữ cảnh B
-	K->>B: Return to user mode
+```
+Runnable → Running → Sleeping (I/O, futex wait) → Runnable (wakeup) → Running
 ```
 
-### 6.1 Khi nào context switch xảy ra nhiều
+- **Running**: đang dùng CPU.
+- **Runnable**: sẵn sàng, đang chờ CPU.
+- **Sleeping interruptible**: chờ event, signal có thể đánh thức.
+- **Sleeping uninterruptible (D state)**: chờ I/O sâu, không kill được bằng signal thường.
 
-- Thread thường xuyên block I/O.
-- Nhiều lock contention.
-- Số thread runnable vượt xa số logical CPU.
-- Time slice nhỏ và workload ngắt quãng.
-
-### 6.2 Chi phí của context switch
-
-Chi phí không chỉ là save/restore register.
-
-Bao gồm:
-
-- Scheduler decision overhead.
-- Cache disturbance (working set mới chưa nóng cache).
-- TLB effects.
-- CPU migration penalty (nếu đổi core).
-
-Mô hình gần đúng:
-
-T_switch = T_save_restore + T_sched + T_cache + T_tlb + T_migration
+D state đáng chú ý: nếu `top` hoặc `ps` thấy nhiều process D state → thường là vấn đề I/O hoặc NFS/kernel bug.
 
 ---
 
-## 7) Memory, MMU, TLB và ảnh hưởng đến multithread
+## 5) Đồng bộ: mutex, spinlock, và futex
 
-### 7.1 Virtual memory và address translation
+### Mutex vs Spinlock
 
-Ứng dụng truy cập địa chỉ ảo. MMU dịch sang địa chỉ vật lý qua page table.
-TLB cache kết quả dịch gần đây để truy cập nhanh.
+| | Mutex | Spinlock |
+|---|---|---|
+| Khi contention | Sleep (vào kernel) | Busy-wait (vẫn trên CPU) |
+| Chi phí | Context switch | Burn CPU cycles |
+| Dùng khi | Critical section dài, hoặc có thể sleep | Critical section **cực ngắn**, không thể sleep (kernel context) |
 
-### 7.2 Vì sao thread có thể nhanh hơn process ở vài trường hợp
+Trong user-space C++: hầu như luôn dùng `std::mutex`. Spinlock chỉ hợp lý khi critical section vài chục nanoseconds và contention thấp.
 
-Thread cùng process chia sẻ address space:
+### Futex — cơ chế nền của mutex
 
-- Truy cập dữ liệu chung trực tiếp.
-- Không cần IPC nặng chỉ để truyền dữ liệu nội bộ.
+Mutex hiện đại dùng 2 tầng:
 
-Nhưng điều này cũng tăng rủi ro:
+1. **Fast path**: atomic CAS ở user-space — không vào kernel nếu lock rảnh.
+2. **Slow path** (contention): gọi `futex_wait` → thread ngủ trong kernel queue.
 
-- Data race.
-- False sharing.
-- Cache coherence traffic lớn.
+Khi unlock: `futex_wake` → thread chờ vào Runnable → scheduler cấp CPU.
 
-### 7.3 False sharing (điểm đau hay gặp)
+**Kết luận**: lock contention = context switch + scheduler overhead. Càng nhiều contention, overhead càng lớn.
 
-Hai thread ghi hai biến khác nhau nhưng cùng nằm trên một cache line:
+### Read-Write Lock
 
-- Cache line bị invalidate qua lại giữa core.
-- Hiệu năng giảm mạnh dù không tranh chấp lock logic.
+`std::shared_mutex` (C++17):
+- Nhiều reader có thể chạy song song.
+- Writer cần exclusive lock — block tất cả reader và writer khác.
+- Hợp lý khi read >> write và critical section đọc nặng.
+- **Lưu ý**: writer starvation có thể xảy ra nếu liên tục có reader mới vào.
 
----
+### Condition Variable
 
-## 8) Trạng thái task trong Linux (mức học bản chất)
+`std::condition_variable` kết hợp với mutex:
 
-Các trạng thái trực giác cần nhớ:
+```cpp
+// Producer
+{
+    std::lock_guard lk(mtx);
+    queue.push(item);
+}
+cv.notify_one();
 
-- Running: đang thực thi trên CPU.
-- Runnable: sẵn sàng chạy, chờ CPU.
-- Sleeping interruptible: ngủ, có thể bị đánh thức bởi sự kiện/signal.
-- Sleeping uninterruptible: thường chờ I/O sâu.
-- Stopped/Traced: bị dừng hoặc debug.
-
-Vòng đời thường gặp của thread server:
-
-Runnable -> Running -> Blocked (I/O hoặc futex wait) -> Runnable (wake) -> Running
-
-### Sơ đồ trạng thái thread/task
-
-```mermaid
-stateDiagram-v2
-	[*] --> Runnable
-	Runnable --> Running: được scheduler chọn
-	Running --> Runnable: hết time slice / bị preempt
-	Running --> Sleeping: chờ I/O, futex wait, sleep
-	Sleeping --> Runnable: wakeup event/signal
-	Running --> Stopped: stop/trace
-	Stopped --> Runnable: continue
+// Consumer
+std::unique_lock lk(mtx);
+cv.wait(lk, []{ return !queue.empty(); });  // predicate tránh spurious wakeup
 ```
 
+Internally: `wait()` unlock mutex → futex_wait → khi notify, futex_wake → reacquire mutex.
+
+**Spurious wakeup**: thread có thể tỉnh giấc mà không có `notify`. Luôn dùng predicate form `cv.wait(lk, predicate)`.
+
 ---
 
-## 9) Đồng bộ đa luồng: tại sao kernel vẫn xuất hiện dù bạn lock ở user-space
+## 6) False sharing và Cache Coherence
 
-### 9.1 Atomic trước, kernel sau
+### Cache coherence (MESI protocol)
 
-Nhiều primitive lock hiện đại dùng chiến lược:
+Mỗi cache line có trạng thái: Modified, Exclusive, Shared, Invalid.
 
-1. Fast path ở user-space bằng atomic.
-2. Chỉ khi contention mới gọi vào kernel (thường qua futex).
+- Core A ghi vào cache line → báo cho các core khác → cache line của chúng chuyển sang Invalid.
+- Core B muốn đọc lại → cache miss → phải fetch từ L3 hoặc RAM.
+- Đây là **cache coherence traffic** — xảy ra kể cả khi không có lock.
 
-### 9.2 Futex là điểm nối user-space và scheduler
+### False sharing
 
-Khi lock bị tranh chấp:
+Hai thread ghi **hai biến khác nhau** nhưng nằm trên **cùng một cache line** (64 bytes):
 
-- Thread thua đi ngủ trong kernel queue.
-- Thread unlock sẽ wake thread cần thiết.
+- Mỗi lần một core ghi → invalidate cache line của core kia.
+- Core kia phải fetch lại từ L3 hoặc RAM → chậm dù không có lock.
 
-Tức là lock contention trực tiếp biến thành context switch + scheduler work.
+**Fix**: padding/alignment để tách các biến ra khác cache line.
 
-### Sơ đồ futex wait/wake (khi có contention)
-
-```mermaid
-flowchart LR
-	T1[Thread 1 lock mutex] -->|success| CS[Critical Section]
-	T2[Thread 2 lock mutex] -->|fail CAS| FWAIT[futex_wait -> ngủ trong kernel]
-	CS --> UNLOCK[Thread 1 unlock]
-	UNLOCK --> FWAKE[futex_wake]
-	FWAKE --> RQ[Thread 2 vào Runnable]
-	RQ --> RUN[Scheduler cấp CPU cho Thread 2]
+```cpp
+struct alignas(64) Counter { std::atomic<int> val; };
 ```
 
+Hay gặp trong: per-thread counter, lock-free queue, ring buffer nhiều producer/consumer.
+
 ---
 
-## 10) Vì sao oversubscription làm hệ thống ì
+## 7) Memory Ordering và Atomic
 
-Oversubscription: số thread runnable nhiều hơn số logical CPU đáng kể.
+`std::atomic` không chỉ là "ghi/đọc an toàn" — quan trọng hơn là **thứ tự quan sát** giữa các thread.
 
-Hệ quả:
+| Order | Ý nghĩa |
+|---|---|
+| `relaxed` | Chỉ đảm bảo atomicity, không đảm bảo thứ tự |
+| `acquire` | Không có load/store nào sau nó bị reorder lên trước |
+| `release` | Không có load/store nào trước nó bị reorder xuống sau |
+| `seq_cst` | Tất cả thread thấy cùng thứ tự — mạnh nhất, đắt nhất |
 
-- Context switch dày.
+**Rule of thumb cho Middleware**:
+- Flag check đơn giản: `relaxed` đủ nếu có acquire/release ở chỗ khác bảo vệ.
+- Producer/consumer với shared buffer: `release` khi ghi, `acquire` khi đọc.
+- Không chắc: dùng `seq_cst` — đúng nhưng chậm hơn.
+
+```cpp
+// Producer
+data.store(value, std::memory_order_relaxed);
+ready.store(true, std::memory_order_release);  // đảm bảo data ghi trước ready
+
+// Consumer
+while (!ready.load(std::memory_order_acquire));  // thấy ready=true thì data đã sẵn
+auto v = data.load(std::memory_order_relaxed);
+```
+
+**`volatile` ≠ `atomic`**: `volatile` chỉ ngăn compiler optimize đọc/ghi, không có bảo đảm atomicity hay memory ordering. Không dùng `volatile` cho thread communication trong C++.
+
+---
+
+## 8) Oversubscription và Thread Pool
+
+### Oversubscription
+
+Số thread runnable >> số logical CPU → hệ thống ì:
+
+- Context switch dày đặc.
 - Cache miss tăng.
-- Độ trễ tail latency xấu đi.
-- Throughput có thể không tăng, thậm chí giảm.
+- Tail latency xấu.
 
-Quy tắc trực giác:
+**Nguyên tắc**:
+- **CPU-bound**: số worker ≈ số logical CPU.
+- **I/O-bound**: có thể nhiều hơn, nhưng phải đo thực tế.
 
-- CPU-bound workload: số worker gần số logical CPU (hoặc thấp hơn chút) thường tốt hơn.
-- I/O-bound workload: có thể nhiều thread hơn, nhưng vẫn phải đo thực tế.
+### Thread Pool
 
----
+Thay vì tạo/hủy thread theo từng request → dùng pool cố định:
 
-## 11) NUMA và CPU affinity: phần nâng cao nhưng cực quan trọng
+- Tránh overhead `clone()` + stack allocation mỗi lần.
+- Giữ số thread ổn định, tránh oversubscription.
+- Task queue thường là lock-free hoặc dùng mutex + condition variable.
 
-Trên máy nhiều socket hoặc NUMA node:
-
-- Truy cập RAM local node nhanh hơn remote node.
-- Thread migrate giữa node có thể làm dữ liệu không còn local.
-
-Kỹ thuật vận hành:
-
-- Pin thread theo CPU set trong vài hệ thống low-latency.
-- Giữ dữ liệu gần nơi thread chạy để tăng locality.
+Pattern cơ bản: N worker thread ngủ, wakeup khi có task, lấy task từ queue, xử lý, ngủ lại.
 
 ---
 
-## 12) Ảnh hưởng của interrupt lên scheduling
+## 9) Các vấn đề đồng bộ thường gặp
 
-Interrupt có thể preempt luồng hiện tại để xử lý sự kiện phần cứng.
+### Deadlock
 
-Chuỗi tác động:
+Xảy ra khi 2 thread cầm lock của nhau và đợi nhau mãi.
 
-1. IRQ đến.
-2. CPU vào kernel handler.
-3. Có thể wake task đang ngủ chờ event.
-4. Scheduler đánh giá có cần chuyển task ngay không.
+**Phòng tránh**:
+- Luôn acquire lock theo **thứ tự cố định** — ví dụ lock A trước B trong toàn bộ code.
+- Dùng `std::lock(a, b)` hoặc `std::scoped_lock(a, b)` — acquire cả 2 atomic, tránh deadlock.
+- Tránh gọi callback hay virtual function khi đang giữ lock — callback có thể acquire lock khác.
 
-Nên latency của app không chỉ do code app, mà còn do nhiễu interrupt và chính sách scheduling.
+### Priority Inversion
 
----
+Thread ưu tiên thấp giữ lock → thread ưu tiên cao phải chờ → hiệu ứng: ưu tiên bị "đảo ngược".
 
-## 13) Mô hình tư duy đúng để học sâu multithreading
+Giải pháp: **Priority Inheritance** — kernel tạm thời boost priority của thread đang giữ lock lên bằng thread đang chờ. `pthread_mutexattr_setprotocol(PTHREAD_PRIO_INHERIT)`.
 
-Thay vì nghĩ "thread tự chạy", hãy nghĩ:
+### Lock Convoy
 
-1. Thread chỉ là task đang cạnh tranh quyền dùng CPU.
-2. Scheduler quyết định quyền chạy theo policy và trạng thái hệ thống.
-3. Mọi block/wakeup đều là tín hiệu làm thay đổi đồ thị lập lịch.
-4. Hiệu năng là tổng hợp của scheduler + memory hierarchy + sync design.
+Nhiều thread cùng tranh 1 lock → thread vừa release lock bị preempt ngay → thread khác wakeup, acquire lock, lại bị preempt → cả đoàn thread chờ nhau lần lượt → throughput thảm.
 
----
+Dấu hiệu: lock contention cao nhưng thực ra không ai giữ lock lâu.
 
-## 14) Những ngộ nhận phổ biến
+### ABA Problem
 
-1. "Tăng thread luôn nhanh hơn"
-- Sai. Có giới hạn song song hóa và overhead.
+Xảy ra với lock-free CAS:
+1. Thread đọc giá trị A.
+2. Thread khác đổi A → B → A.
+3. Thread gốc CAS thành công dù pointer A đã là object khác.
 
-2. "Thread switch gần như miễn phí"
-- Sai. Switch có chi phí trực tiếp và gián tiếp qua cache/TLB.
+Fix: dùng **tagged pointer** — kèm counter tăng dần vào trong giá trị atomic.
 
-3. "Thread cùng process thì không cần đồng bộ"
-- Sai. Chia sẻ bộ nhớ càng cần đồng bộ đúng cách.
+### Thundering Herd
 
-4. "CPU 8 core thì cứ 100 thread CPU-bound"
-- Thường phản tác dụng vì oversubscription.
+`notify_all()` đánh thức nhiều thread cùng lúc, nhưng chỉ 1 thread thắng lock, còn lại ngủ lại → lãng phí context switch.
+
+Dùng `notify_one()` khi có thể. Chỉ dùng `notify_all()` khi thực sự tất cả thread cần xem xét lại điều kiện.
 
 ---
 
-## 15) Khung phân tích hiệu năng đa luồng trên Linux (không cần code)
+## 10) NUMA (nếu bị hỏi)
 
-Khi thấy app đa luồng chậm, phân tích theo thứ tự:
+Trên server nhiều socket:
 
-1. Thread đang CPU-bound hay I/O-bound?
-2. Số runnable thread so với số logical CPU?
-3. Có lock contention cao không?
-4. Context switch rate có quá lớn không?
-5. Có migration liên tục giữa CPU không?
-6. Có dấu hiệu cache miss/false sharing?
-7. Có NUMA remote memory access cao?
+- RAM gần socket nào thì core ở socket đó truy cập nhanh hơn (local access).
+- Thread migrate sang socket khác → remote memory access → latency cao hơn.
+- Low-latency system thường **pin thread** vào CPU set cố định (`pthread_setaffinity_np` hoặc `taskset`).
+- `numactl` để bind process vào NUMA node cụ thể.
 
 ---
 
-## 16) Kết nối với phần Process/IPC bạn đang học
+## 11) Thread-local Storage
 
-Bạn đang học Unix socket, shared memory, signals, network socket.
-Đây là điểm giao rất quan trọng với multithreading:
+`thread_local` biến mỗi thread có bản sao riêng — không cần sync.
 
-- Thread nào block trên recv/select sẽ đi vào trạng thái ngủ và nhường CPU.
-- Event I/O đến sẽ wake thread tương ứng.
-- Nếu một process dùng nhiều thread xử lý I/O + worker compute, scheduler sẽ liên tục cân bằng giữa nhóm thread này.
+```cpp
+thread_local uint64_t thread_id = 0;
+thread_local std::vector<int> per_thread_buffer;
+```
 
-Nói cách khác, IPC/I-O chính là "nguồn kích hoạt" gây block/wakeup, và block/wakeup chính là nhịp tim của multithread runtime.
-
----
-
-## 17) Roadmap học tiếp (phần siêu sâu)
-
-Gợi ý lộ trình 4 tầng:
-
-1. Tầng scheduler internals:
-- Runqueue per-CPU, vruntime, wakeup preemption, load balancing.
-
-2. Tầng memory internals:
-- TLB, page fault, cache coherence, false sharing, NUMA locality.
-
-3. Tầng synchronization internals:
-- Atomic memory ordering, futex wait/wake path, lock convoy.
-
-4. Tầng observability thực chiến:
-- Đo context switch, runqueue latency, CPU migration, lock contention.
+Dùng tốt cho: per-thread cache, per-thread random seed, per-thread allocator.
 
 ---
 
-## 18) Tóm tắt một câu
+## 12) Signal và Multithreading
 
-Multithreading trên Linux là bài toán cấp phát CPU time cho nhiều task cạnh tranh nhau, trong đó hiệu năng thực tế được quyết định bởi scheduler policy, hành vi block/wakeup, và chất lượng locality của bộ nhớ/cache nhiều hơn là bởi việc "tạo được bao nhiêu thread".
+- Signal được deliver tới **một thread nào đó** trong process, không đảm bảo thread nào.
+- `SIGSEGV`, `SIGFPE` deliver đến thread gây ra fault.
+- Cách an toàn: dùng `sigwait()` hoặc `signalfd()` ở một thread chuyên xử lý signal, các thread còn lại block hết signal bằng `pthread_sigmask`.
+
+---
+
+## 13) Những câu hỏi interview hay gặp
+
+### Khái niệm cơ bản
+
+**"Process và thread khác nhau thế nào ở mức kernel Linux?"**
+→ Đều là task (task_struct). Thread chia sẻ address space, fd table, signal handler với nhau trong cùng process. Process thì không. Clone() với flag CLONE_VM tạo thread, fork() copy address space.
+
+**"Thread switch và process switch khác nhau chỗ nào?"**
+→ Thread cùng process không cần TLB flush (cùng mm_struct), chỉ save/restore register và stack. Process switch phải flush TLB, overhead lớn hơn. Nhưng thread switch vẫn bị cache cold nếu working set khác nhau.
+
+**"Kernel thread và user thread là gì?"**
+→ Kernel thread: task chạy hoàn toàn trong kernel space, không có user-space counterpart. User thread: thread của ứng dụng, được map 1:1 với kernel task trên Linux (NPTL model). Không còn M:N hay green thread ở mức POSIX trên Linux hiện đại.
+
+**"Daemon thread là gì?"**
+→ Thread chạy nền, không ngăn process exit. Trong C++: `t.detach()`. Khi main thread kết thúc, daemon thread bị kill. Nguy hiểm nếu đang giữ lock hoặc chưa flush buffer.
+
+---
+
+### Scheduler và Performance
+
+**"Tăng thread là tăng performance?"**
+→ Không. Giới hạn bởi số core (CPU-bound) và overhead context switch/contention. Amdahl's Law: nếu 20% code là sequential thì dù vô hạn thread, speedup tối đa chỉ 5x.
+
+**"Thread switch có tốn không?"**
+→ Có. Cache cold + TLB (nếu khác process) + scheduler decision. Không phải chỉ save/restore register. Voluntary switch (block I/O) thường rẻ hơn involuntary (timer preempt) vì thread tự nguyện nhường thường đã không còn nhiều data trên cache.
+
+**"8 core thì dùng 100 thread CPU-bound được không?"**
+→ Không. Oversubscription gây context switch storm. 92 thread chờ CPU, liên tục switch qua lại, cache liên tục bị invalidate. Throughput giảm, latency tăng.
+
+**"Làm sao đo số context switch đang xảy ra?"**
+→ `vmstat 1` (cs column), `pidstat -w -p <pid>`, `/proc/<pid>/status` (voluntary_ctxt_switches + nonvoluntary_ctxt_switches).
+
+**"CFS là gì, vì sao I/O-bound thread thường có latency thấp hơn CPU-bound?"**
+→ CFS track vruntime. I/O thread thường xuyên sleep → vruntime tích lũy chậm → khi wakeup có vruntime nhỏ → được ưu tiên chạy sớm hơn thread CPU-bound đang ngốn CPU liên tục.
+
+---
+
+### Mutex, Lock, Sync
+
+**"Mutex và spinlock: khi nào dùng cái nào?"**
+→ Mutex khi critical section dài hoặc có thể sleep → kernel sleep/wakeup. Spinlock khi critical section vài chục ns, không được sleep (interrupt context, kernel code). Trong user-space C++ hầu như luôn mutex; spinlock chỉ hợp lý với low-contention + cực ngắn.
+
+**"Mutex hoạt động thế nào khi không có contention?"**
+→ Fast path: atomic CAS ở user-space (futex). Nếu lock rảnh thì xong, không vào kernel. Chi phí chỉ là một atomic instruction. Khi có contention mới gọi futex_wait → vào kernel → sleep.
+
+**"Condition variable, tại sao phải dùng loop/predicate thay vì if?"**
+→ Spurious wakeup — thread có thể tỉnh giấc không có notify. Và nếu có 2 thread wait cùng cv, notify_all đánh thức cả 2 nhưng chỉ 1 thread có thể lấy được điều kiện. Thread kia phải wait lại.
+
+**"Deadlock phòng tránh thế nào?"**
+→ Lock ordering cố định. Dùng `std::scoped_lock` khi cần acquire nhiều lock cùng lúc. Không gọi callback/virtual function khi đang giữ lock. Lock timeout (`try_lock_for`) để detect deadlock.
+
+**"Priority inversion là gì?"**
+→ Thread ưu tiên thấp giữ lock, thread ưu tiên cao phải chờ. Trong hệ thống RT có thể dùng priority inheritance mutex (`PTHREAD_PRIO_INHERIT`) — kernel tạm boost priority của thread đang giữ lock.
+
+**"Read-write lock khi nào tốt hơn mutex?"**
+→ Khi read nhiều, write ít, và critical section đọc đủ nặng để amortize overhead của rw_lock. Nếu read rất ngắn (< 100ns), overhead quản lý reader count đôi khi còn đắt hơn plain mutex.
+
+---
+
+### Atomic và Memory Model
+
+**"volatile và atomic khác nhau thế nào?"**
+→ `volatile` chỉ ngăn compiler tối ưu hóa đọc/ghi (dùng cho MMIO). Không có bảo đảm atomicity, không có memory ordering. `std::atomic` đảm bảo cả hai. Không dùng `volatile` cho thread communication trong C++.
+
+**"seq_cst, acquire/release, relaxed — khi nào dùng gì?"**
+→ `relaxed`: chỉ cần atomicity, không cần ordering (counter đơn giản). `acquire/release`: producer-consumer pattern, đảm bảo data visible trước khi flag visible. `seq_cst`: cần total order toàn bộ hệ thống — đúng nhưng có thể 2-3x chậm hơn trên ARM.
+
+**"Memory barrier là gì?"**
+→ Instruction ngăn CPU và compiler reorder memory operation qua barrier. Acquire barrier: không reorder load về trước. Release barrier: không reorder store về sau. `std::atomic` với memory order tự chèn barrier phù hợp.
+
+**"ABA problem là gì?"**
+→ Lock-free CAS: đọc A, context switch, thread khác đổi A→B→A, CAS thành công dù pointer A là object mới. Fix: tagged pointer — giá trị atomic gồm pointer + monotonic counter, CAS fail nếu counter khác dù pointer giống.
+
+---
+
+### Design và Patterns
+
+**"Thread pool tốt hơn spawn thread theo request ở điểm nào?"**
+→ Tránh overhead `clone()` + stack allocation + kernel task setup mỗi lần. Giữ số thread ổn định. Warm cache. Có thể limit concurrency để tránh oversubscription.
+
+**"Lock-free khi nào nên dùng?"**
+→ Khi benchmark chứng minh mutex là bottleneck thực sự. Lock-free code phức tạp, khó debug, dễ sai memory ordering. Không dùng chỉ vì "nghe có vẻ nhanh hơn". Nhiều "lock-free" code thực ra chỉ là wait-free ở fast path còn có fallback lock.
+
+**"Làm sao implement producer-consumer queue an toàn?"**
+→ Đơn giản: `std::queue` + `std::mutex` + `std::condition_variable`. Consumer wait khi empty, producer notify khi push. Nếu cần hiệu năng cao: lock-free ring buffer với atomic head/tail (nhưng chỉ khi đây thực sự là bottleneck).
+
+**"False sharing gặp ở đâu hay nhất trong Middleware?"**
+→ Per-thread counter trong struct chung, cache line trong ring buffer nhiều producer, hot field nằm cạnh cold field trong cùng struct. Fix: `alignas(64)`, tách field hay update thành struct riêng, hoặc padding.
+
+**"Thundering herd là gì và fix thế nào?"**
+→ `notify_all()` đánh thức nhiều thread nhưng chỉ 1 thắng lock. Còn lại sleep lại → lãng phí N-1 context switch. Fix: dùng `notify_one()` khi chỉ 1 thread cần xử lý. Dùng `notify_all()` khi điều kiện thay đổi ảnh hưởng tất cả waiter.
+
+**"Signal trong multithreaded process nên xử lý thế nào?"**
+→ Block hết signal ở tất cả worker thread bằng `pthread_sigmask`. Tạo một thread chuyên dùng `sigwait()` hoặc `signalfd()` để xử lý. Tránh gọi non-async-signal-safe function trong signal handler.
+
+---
+
+## 14) Một câu tóm tắt
+
+> Multithreading trên Linux: nhiều task cạnh tranh CPU time. Hiệu năng thực tế phụ thuộc vào scheduler, hành vi block/wakeup, cache locality — không phải số lượng thread.
