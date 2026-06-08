@@ -38,51 +38,12 @@ Phân loại page fault:
 - Stack: biến cục bộ, call frame.
 - mmap region: shared library, file mapping, anonymous mapping.
 
-### Sơ đồ 1: Layout bộ nhớ tiến trình (đơn giản hóa)
+Tóm tắt nhanh bằng chữ thay cho sơ đồ:
 
-```mermaid
-flowchart TB
-    A[Địa chỉ cao] --> B[Kernel Space\nứng dụng user không truy cập trực tiếp]
-    B --> C[mmap Region\nshared libs, file mapping, anonymous mapping]
-    C --> D[Heap\nnew/malloc\nthường tăng lên trên]
-    D --> E[Data + BSS\nglobal/static]
-    E --> F[Text/Code]
-    F --> G[Địa chỉ thấp]
-
-    H[Stack\nbiến local, call frame\nthường tăng xuống dưới]:::stack
-
-    classDef stack fill:#fff4d6,stroke:#8a6d3b,color:#111;
-```
-
-### Sơ đồ 2: MMU dịch địa chỉ
-
-```mermaid
-flowchart LR
-    A[CPU load/store\nvirtual address] --> B[TLB lookup]
-    B -->|Hit| C[Physical address]
-    B -->|Miss| D[Page Table Walk]
-    D --> E{PTE hợp lệ?}
-    E -->|Có| F[Update TLB]
-    F --> C
-    E -->|Không| G[Page Fault trap to kernel]
-    G --> H[Kernel map page\nhoặc nạp từ disk/swap]
-    H --> F
-```
-
-### Sơ đồ 3: Vòng đời page fault
-
-```mermaid
-stateDiagram-v2
-    [*] --> TruyCapBoNhoAo
-    TruyCapBoNhoAo --> TLBHit: Có mapping trong TLB
-    TruyCapBoNhoAo --> TLBMiss: Không có mapping
-    TLBMiss --> MinorFault: Trang đã có sẵn
-    TLBMiss --> MajorFault: Cần đọc từ disk/swap
-    MinorFault --> TiepTucChay
-    MajorFault --> TiepTucChay
-    TLBHit --> TiepTucChay
-    TiepTucChay --> [*]
-```
+- Không gian địa chỉ user thường gồm: text -> data/BSS -> heap -> mmap region -> stack.
+- Heap thường mở rộng lên phía địa chỉ cao hơn, stack thường mở rộng xuống phía địa chỉ thấp hơn.
+- CPU truy cập địa chỉ ảo, MMU tra TLB/page table để dịch sang địa chỉ vật lý.
+- Nếu chưa có mapping hợp lệ sẽ phát sinh page fault, kernel xử lý xong thì tiến trình chạy tiếp.
 
 ## 4) Giới hạn Stack, Heap và bộ nhớ tối đa
 
