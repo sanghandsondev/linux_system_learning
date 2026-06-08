@@ -1,80 +1,123 @@
-1. Message Queue
-- A Message Queue is identified uniquely by the ID (which is a string). And it resides and is managed by the Kernel/OS.
-- Process can create a new message QUEUE or can use an existing msgQUEUE which was created by another process.
-    (There can be multiple message Queues created by several proccesses in the system.)
-- Process A (Sender) with post the data to the message QUEUE, and the process B (receiver) reads the data from that.
+# Message Queue
 
-Process A ----------- Message Queue (Kernel/OS) -----------> Process B
+## 1. Overview
 
-2. Message Queue Creation
-- If mq_open() succeeds, it returns a file descriptor(a handle) to msgQ -> Using this handle
-    mqd_t mq_open(const char* name, int oflag);
-    mqd_t mq_open(const char* name, int oflag, mode_t mode, struct mq_attr *attr);
+- A Message Queue is identified uniquely by an **ID** (which is a string). It resides and is managed by the **Kernel/OS**.
+- A process can create a new message queue or use an existing one created by another process.
 
-+ name: Name of msgQ, e.g., "/server-msg-q", "/mq/msgqueue" (unique)
-+ oflag: operational flags
-    O_RDONLY: Process can only read msgs from msgQ
-    O_WRONLY: Process can only write msgs into the msgQ
-    O_RDWR:   Process can write and read msgs to and from msgQ
-    O_CREAT: The queue is created if not exist already
-    O_EXCL:  mq_open() fails if process try to open an existing msgQ
-+ mode: permissions set by the owning process on the queue, usually 0660
-+ attr: specify various attributes of the msgQ being created.
+```mermaid
+flowchart LR
+    A[Process A<br>Sender] -->|mq_send| MQ[(Message Queue<br>Kernel/OS)]
+    MQ -->|mq_receive| B[Process B<br>Receiver]
+```
 
+## 2. Message Queue Creation — `mq_open()`
+
+```c
+mqd_t mq_open(const char* name, int oflag);
+mqd_t mq_open(const char* name, int oflag, mode_t mode, struct mq_attr *attr);
+```
+
+If `mq_open()` succeeds, it returns a **file descriptor** (handle) to the message queue.
+
+### Parameters
+
+| Parameter | Description |
+|-----------|-------------|
+| `name` | Unique name, e.g., `"/server-msg-q"`, `"/mq/msgqueue"` |
+| `oflag` | Operational flags (see below) |
+| `mode` | Permissions, usually `0660` |
+| `attr` | Attributes of the queue being created |
+
+### Operational Flags (`oflag`)
+
+| Flag | Meaning |
+|------|---------|
+| `O_RDONLY` | Process can only **read** msgs from queue |
+| `O_WRONLY` | Process can only **write** msgs into queue |
+| `O_RDWR` | Process can read and write |
+| `O_CREAT` | Create the queue if it doesn't exist |
+| `O_EXCL` | `mq_open()` **fails** if queue already exists |
+
+### Attributes Structure
+
+```c
 struct mq_attr {
     long mq_flags;      // Flags: 0
     long mq_maxmsg;     // Max number of messages on queue
     long mq_msgsize;    // Max size (bytes) of a message
     long mq_curmsgs;    // Number of msgs currently in queue
 };
+```
 
-Example: mqd_t msgq = mq_open("/server-msg-q", O_RDONLY | O_CREAT | O_EXCL, 0660, 0);
-Example 2: mqt_t msgq;
-           struct mq_attr attr;
+### Examples
 
-           attr.mq_flags = 0;
-           attr.mq_maxmsg = 10;
-           attr.mq_msgsize = 4096;
-           attr.mq_curmsgs = 0;
+```c
+// Simple creation
+mqd_t msgq = mq_open("/server-msg-q", O_RDONLY | O_CREAT | O_EXCL, 0660, 0);
 
-           msgq = mq_open("/server-msg-q", O_RDONLY | O_CREAT | O_EXCL, 0660, &attr);
+// With attributes
+struct mq_attr attr;
+attr.mq_flags   = 0;
+attr.mq_maxmsg  = 10;
+attr.mq_msgsize = 4096;
+attr.mq_curmsgs = 0;
 
-3. Message Queue Closing
-- OS indicates that by reference_count (number of processes which opening the msgQ from mq_open())
-- So when reference_count = 0 -> Kernel/OS removes and destroy that kernel resource (msgQ).
-    int mq_close(mqd_t msgQ);
+mqd_t msgq = mq_open("/server-msg-q", O_RDONLY | O_CREAT | O_EXCL, 0660, &attr);
+```
 
-4. Enqueue a Message
-    int mq_send(mqd_t msgQ, char* msg_ptr, size_t msg_len, unsigned int msg_prio);
+## 3. Message Queue Closing — `mq_close()`
 
-- mq_send() is for sending a message to the queue refered by the descriptor msgQ
-+ msg_ptr: the message buffer
-+ msg_len: the size of the message, which should be less than or equal to the message size for the queue.
-+ msg_prio: the message priority, which is a non-negative (>= 0) number. Messages are placed in the queue in the decreasing order of message priority.
+```c
+int mq_close(mqd_t msgQ);
+```
 
-- If the queue is FULL, mq_send() blocks till there is space on the queue, unless the O_NONBLOCK flag is enabled for the message queue
-    --> In which case, mq_send() returns immediately with errno set to EAGAIN.
+- OS tracks `reference_count` (number of processes that opened the queue via `mq_open()`).
+- When `reference_count == 0` → Kernel removes and destroys the message queue.
 
-5. Dequeue a Message
-    int mq_receive(mqd_t msgQ, char* msg_ptr, size_t msg_len, unsigned int *msg_prio);
+## 4. Enqueue a Message — `mq_send()`
 
-+ msg_ptr: point to empty messasge buffer
-+ msg_len: size of the buffer in bytes
-- The oldest msg of the highest priority is deleted from the queue and passed to the process in the buffer pointed by msg_ptr
-- If the pointer msg_prio is not null, the priority of the received msg = *msg_prio (value of pointer)
-- The default behavior of mq_receive() is to block if there is no messasge in the queue.
-    However, if the O_NONBLOCK flag is enabled for the queue, and the queue is empty. 
-    -> mq_receive() returns immediately with errno set to EAGAIN.
+```c
+int mq_send(mqd_t msgQ, char* msg_ptr, size_t msg_len, unsigned int msg_prio);
+```
 
-- On success, mq_receive() returns the number of bytes receveid in the buffer pointed by msg_ptr (maybe = msg_len)
+| Parameter | Description |
+|-----------|-------------|
+| `msg_ptr` | The message buffer |
+| `msg_len` | Size of message (≤ `mq_msgsize`) |
+| `msg_prio` | Priority (≥ 0). Messages ordered by **decreasing** priority |
 
-6. Using as an IPC
-- A message queue IPC mechanism usually supports N:1 communication paradiagm, meaning can be N senders but 1 receiver per message Queue.
-    Sender process ----
-    Sender process -----|-----> Message Queue (Kernel/OS) --------> Receiver process
-    Sender process ----
+> **Blocking behavior:** If the queue is **FULL**, `mq_send()` blocks until there is space — unless `O_NONBLOCK` is set, in which case it returns immediately with `errno = EAGAIN`.
 
-- However, receiving process can dequeue msgs from different messsage Queues at the same time --> MULTIPLEXING using select()
+## 5. Dequeue a Message — `mq_receive()`
 
-- NOTE: Khi một Message Queue đang được một process sử dụng mq_receive() block thì các process khác sẽ ko chen chân vào được
-      --> Vì vậy có thể nói Process muốn nhận msg từ cơ chế Message Queue này thì phải tự tạo ra một MsgQ và block mq_receive()
+```c
+int mq_receive(mqd_t msgQ, char* msg_ptr, size_t msg_len, unsigned int *msg_prio);
+```
+
+| Parameter | Description |
+|-----------|-------------|
+| `msg_ptr` | Points to empty message buffer |
+| `msg_len` | Size of the buffer in bytes |
+| `msg_prio` | If not NULL, receives the priority of the dequeued message |
+
+- The **oldest** message of the **highest priority** is deleted from the queue and passed to the process.
+- Returns: number of bytes received in `msg_ptr`.
+
+> **Blocking behavior:** If the queue is **EMPTY**, `mq_receive()` blocks — unless `O_NONBLOCK` is set, in which case it returns immediately with `errno = EAGAIN`.
+
+## 6. Using as an IPC
+
+Message Queue supports **N:1** communication paradigm — N senders, 1 receiver per queue.
+
+```mermaid
+flowchart LR
+    S1[Sender 1] --> MQ[(Message Queue<br>Kernel/OS)]
+    S2[Sender 2] --> MQ
+    S3[Sender 3] --> MQ
+    MQ --> R[Receiver Process]
+```
+
+- Receiving process can dequeue messages from **different** message queues at the same time → **Multiplexing** using `select()`.
+
+> **NOTE:** Khi một Message Queue đang được một process sử dụng `mq_receive()` block thì các process khác sẽ không chen chân vào được. Vì vậy, process muốn nhận msg phải tự tạo ra một MsgQ riêng và block `mq_receive()`.

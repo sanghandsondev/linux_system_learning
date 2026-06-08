@@ -1,44 +1,69 @@
-1. Shared Memory
-Process A (Sender) --- write() ----> DATA (Shared Memory - RAM) ------ read() ----> Process B (Receiver)
+# Shared Memory
 
-Memory Mappings -> Shared Memory -> Using External Data Source as Shared Memory
+## 1. Overview
 
-- Virtual Pages of both the Processes maps to same physical pages loaded in RAM. 
-    P1's Virtual Memory ----- MMU -----> RAM (Physical Memory) <------ MMU -------- P2's Virtual Memory
+```mermaid
+flowchart LR
+    A[Process A<br>Sender] -->|"write()"| SHM[(Shared Memory<br>RAM)]
+    SHM -->|"read()"| B[Process B<br>Receiver]
+```
 
+**Memory Mappings → Shared Memory → Using External Data Source as Shared Memory**
+
+```mermaid
+flowchart LR
+    P1[P1's Virtual Memory] -->|MMU| RAM[(RAM<br>Physical Memory)]
+    P2[P2's Virtual Memory] -->|MMU| RAM
+```
+
+- Virtual Pages of both processes map to the **same physical pages** loaded in RAM.
 - Physical Pages in turn are read/written to external memory.
-- Any modification made by P1 in its shared VirtualMemory, shall be seen by P2
---> Used Widely for IPC (not copying data --> fastest IPC)
+- Any modification made by P1 in its shared Virtual Memory **shall be seen by P2**.
 
-2. Walk Steps
-- Initialize the Shared Memory segment -> shm_open()
-- Define the size of the SHM segment -> ftruncate()
-- Map the Shared Memory segment to Data Source -> mmap()
-- Use the Shared Memory -> read() / write()
-- Destroy the mapping between process and Shared Memory segment -> munmap()
-- Destroy shared memory segment - shm_unlink()
+> **→ Used widely for IPC (no copying data → fastest IPC)**
 
-3. Design Constaints for using Shared Memory as IPC
-- Shared Memory approach of IPC is used in a scenario where:
-+ Exactly one processes is responsibile to update the shared memory (publisher process)
-+ Rest of the processes only read the shared memory (Subscriber processes)
-+ The frequency of updatting the shared memory by publisher process should not be very high
-    For example, publisher process update the shared memory when user configure something on the software
+## 2. Walk Steps
 
-- Shared Memory doesn't have built-in synch mechanism.
-- So if multiple processes attempts to update the shared memory at the same time, then it leads to write-write conflict
--> Data race / Race condition
--> We need to handle this situation using Semaphore (Synchronization like Mutex but for multiple processes)
+| Step | API | Description |
+|------|-----|-------------|
+| 1 | `shm_open()` | Initialize the Shared Memory segment |
+| 2 | `ftruncate()` | Define the size of the SHM segment |
+| 3 | `mmap()` | Map the SHM segment to Data Source |
+| 4 | `read()` / `write()` | Use the Shared Memory |
+| 5 | `munmap()` | Destroy the mapping between process and SHM |
+| 6 | `shm_unlink()` | Destroy the shared memory segment |
 
-- When publisher process update the shared memory
+## 3. Design Constraints for using Shared Memory as IPC
 
-        Process B1 <---- Notify update ---- Process A ---- Notify update ----> Process  B2
-       (Subscriber)                        (Publisher)                        (Subscriber)
-            |                                  |                                    |
-          read()                            write()                               read()
-            |                                  |                                    |
-             ------------------ [DATA] Shared Memory - RAM -------------------------
+Shared Memory IPC is used in a scenario where:
 
-+ Việc notify subscriber cũng sẽ sử dụng 'Semaphore'
+- **Exactly one** process is responsible to update the shared memory (**Publisher**)
+- Rest of the processes only **read** the shared memory (**Subscribers**)
+- The frequency of updating should **not be very high** (e.g., user configures something on the software)
 
-NOTE: lưu ý khi biên dịch: gcc -g example.c -lrt -lpthread -o example
+### Race Condition Problem
+
+- Shared Memory **doesn't have built-in synchronization**.
+- If multiple processes attempt to update at the same time → **write-write conflict** (Data Race).
+- Solution: **Semaphore** (synchronization like Mutex but for multiple processes).
+
+### Publisher-Subscriber Pattern
+
+```mermaid
+flowchart TB
+    A[Process A<br>Publisher] -->|"write()"| SHM[(Shared Memory<br>RAM)]
+    A -->|"Notify (Semaphore)"| B1[Process B1<br>Subscriber]
+    A -->|"Notify (Semaphore)"| B2[Process B2<br>Subscriber]
+    B1 -->|"read()"| SHM
+    B2 -->|"read()"| SHM
+```
+
+- Việc notify subscriber cũng sử dụng **Semaphore**.
+
+## 4. Build Command
+
+```bash
+gcc -g example.c -lrt -lpthread -o example
+```
+
+> **Note:** Cần link `-lrt` (POSIX realtime) và `-lpthread` khi biên dịch.
